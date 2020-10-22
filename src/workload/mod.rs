@@ -11,6 +11,7 @@ use strum::*;
 
 pub mod read;
 pub mod write;
+pub mod null;
 
 #[derive(Debug, Error)]
 pub enum WorkloadError {

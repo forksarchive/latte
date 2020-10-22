@@ -21,6 +21,7 @@ use crate::stats::{BenchmarkCmp, BenchmarkStats, QueryStats, Recorder};
 use crate::workload::read::Read;
 use crate::workload::write::Write;
 use crate::workload::{Workload, WorkloadStats};
+use crate::workload::null::Null;
 
 mod config;
 mod progress;
@@ -47,6 +48,8 @@ async fn workload(conf: &RunCommand, session: Session) -> Arc<dyn Workload> {
     match conf.workload {
         config::Workload::Read => Arc::new(unwrap_workload(Read::new(session, &wc).await)),
         config::Workload::Write => Arc::new(unwrap_workload(Write::new(session, &wc).await)),
+        config::Workload::Null => Arc::new(Null {}),
+
     }
 }
 
@@ -261,8 +264,7 @@ async fn async_main() {
 fn main() {
     console::set_colors_enabled(true);
     let mut runtime = tokio::runtime::Builder::new()
-        .max_threads(1)
-        .basic_scheduler()
+        .threaded_scheduler()
         .enable_time()
         .build()
         .unwrap();
