@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 pub enum Workload {
     Read,
     Write,
-    Null
+    Null,
 }
 
 impl Display for Workload {

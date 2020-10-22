@@ -10,7 +10,6 @@ use super::Result;
 /// Its purpose is testing the benchmarking machinery.
 pub struct Null {}
 
-
 #[async_trait]
 impl Workload for Null {
     fn populate_count(&self) -> u64 {
@@ -18,11 +17,16 @@ impl Workload for Null {
     }
 
     async fn populate(self: Arc<Self>, _iteration: u64) -> Result<WorkloadStats> {
-        Ok(WorkloadStats { row_count: 0, partition_count: 0 })
+        Ok(WorkloadStats {
+            row_count: 0,
+            partition_count: 0,
+        })
     }
 
     async fn run(self: Arc<Self>, _iteration: u64) -> Result<WorkloadStats> {
-        Ok(WorkloadStats { row_count: 1, partition_count: 1 })
+        Ok(WorkloadStats {
+            row_count: 1,
+            partition_count: 1,
+        })
     }
 }
-

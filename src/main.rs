@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::cmp::max;
 use std::path::PathBuf;
 use std::process::exit;
@@ -5,10 +6,8 @@ use std::sync::Arc;
 
 use cassandra_cpp::Session;
 use clap::Clap;
+use futures::StreamExt;
 use tokio::macros::support::Future;
-use tokio::stream::StreamExt;
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::Semaphore;
 use tokio::time::{Duration, Instant, Interval};
 
 use config::RunCommand;
@@ -18,10 +17,10 @@ use crate::progress::FastProgressBar;
 use crate::report::{Report, RunConfigCmp};
 use crate::session::*;
 use crate::stats::{BenchmarkCmp, BenchmarkStats, QueryStats, Recorder};
-use crate::workload::read::Read;
-use crate::workload::write::Write;
 use crate::workload::{Workload, WorkloadStats};
 use crate::workload::null::Null;
+use crate::workload::read::Read;
+use crate::workload::write::Write;
 
 mod config;
 mod progress;
@@ -49,7 +48,6 @@ async fn workload(conf: &RunCommand, session: Session) -> Arc<dyn Workload> {
         config::Workload::Read => Arc::new(unwrap_workload(Read::new(session, &wc).await)),
         config::Workload::Write => Arc::new(unwrap_workload(Write::new(session, &wc).await)),
         config::Workload::Null => Arc::new(Null {}),
-
     }
 }
 
@@ -93,61 +91,46 @@ where
     R: Future<Output = Result<WorkloadStats, RE>> + Send,
     RE: Send,
 {
-    let progress = Arc::new(FastProgressBar::new_progress_bar(name, count));
-    let mut stats = Recorder::start(rate, parallelism);
-    let mut interval = interval(rate.unwrap_or(f64::MAX));
-    let semaphore = Arc::new(Semaphore::new(parallelism));
+    let progress = FastProgressBar::new_progress_bar(name, count);
+    let stats = RefCell::new(Recorder::start(rate, parallelism));
+    let interval = interval(rate.unwrap_or(f64::MAX));
 
-    type Item = Result<QueryStats, ()>;
-    let (tx, mut rx): (Sender<Item>, Receiver<Item>) = tokio::sync::mpsc::channel(parallelism);
-
-    for i in 0..count {
-        if rate.is_some() {
-            interval.tick().await;
-        }
-        let permit = semaphore.clone().acquire_owned().await;
-        let concurrent_count = parallelism - semaphore.available_permits();
-        stats.enqueued(concurrent_count);
-
-        let now = Instant::now();
-        if now - stats.last_sample_time() > sampling_period {
-            let start_time = stats.start_time;
-            let elapsed_rounded = round(now - start_time, sampling_period);
-            let sample_time = start_time + elapsed_rounded;
-            let log_line = stats.sample(sample_time).to_string();
-            progress.println(log_line);
-        }
-
-        while let Ok(d) = rx.try_recv() {
-            stats.record(d);
-            progress.tick();
-        }
-        let mut tx = tx.clone();
-        let context = context.clone();
-        tokio::spawn(async move {
-            let start = Instant::now();
-            match action(context, i).await {
-                Ok(result) => {
-                    let end = Instant::now();
-                    let s = QueryStats {
+    interval
+        .take(count as usize)
+        .enumerate()
+        .map(|(i, _)| {
+            let context = context.clone();
+            async move {
+                let start = Instant::now();
+                let result = action(context, i as u64).await;
+                let end = Instant::now();
+                result.map(|s|
+                    QueryStats {
                         duration: max(Duration::from_micros(1), end - start),
-                        row_count: result.row_count,
-                        partition_count: result.partition_count,
-                    };
-                    tx.send(Ok(s)).await.unwrap();
-                }
-                Err(_) => tx.send(Err(())).await.unwrap(),
+                        row_count: s.row_count,
+                        partition_count: s.partition_count,
+                    }
+                )
             }
-            drop(permit);
-        });
-    }
-    drop(tx);
+        })
+        .for_each_concurrent(parallelism, |qs| async {
+            let r = qs.await;
+            let mut stats = stats.borrow_mut();
+            stats.record(r);
+            progress.tick();
 
-    while let Some(d) = rx.next().await {
-        stats.record(d);
-        progress.tick();
-    }
-    stats.finish()
+            let now = Instant::now();
+            if now - stats.last_sample_time() > sampling_period {
+                let start_time = stats.start_time;
+                let elapsed_rounded = round(now - start_time, sampling_period);
+                let sample_time = start_time + elapsed_rounded;
+                let log_line = stats.sample(sample_time).to_string();
+                progress.println(log_line);
+            }
+        })
+        .await;
+
+    stats.into_inner().finish()
 }
 
 fn load_report_or_abort(path: &PathBuf) -> Report {
@@ -264,7 +247,7 @@ async fn async_main() {
 fn main() {
     console::set_colors_enabled(true);
     let mut runtime = tokio::runtime::Builder::new()
-        .threaded_scheduler()
+        .basic_scheduler()
         .enable_time()
         .build()
         .unwrap();

@@ -201,7 +201,6 @@ impl Rational for &str {
     }
 }
 
-
 impl Display for Significance {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let levels = [0.0001, 0.001, 0.01];
