@@ -1,14 +1,14 @@
-use std::cell::RefCell;
 use std::cmp::max;
 use std::path::PathBuf;
 use std::process::exit;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cassandra_cpp::Session;
 use clap::Clap;
-use futures::StreamExt;
-use tokio::macros::support::Future;
-use tokio::time::{Duration, Instant, Interval};
+use futures::{SinkExt, Stream, StreamExt, Future, TryFutureExt, executor};
+use futures::executor::LocalPool;
+use futures::task::{LocalSpawnExt, SpawnExt};
 
 use config::RunCommand;
 
@@ -16,11 +16,12 @@ use crate::config::{AppConfig, Command, ShowCommand};
 use crate::progress::FastProgressBar;
 use crate::report::{Report, RunConfigCmp};
 use crate::session::*;
-use crate::stats::{BenchmarkCmp, BenchmarkStats, QueryStats, Recorder};
+use crate::stats::{BenchmarkCmp, BenchmarkStats, RequestStats, Recorder};
 use crate::workload::{Workload, WorkloadStats};
 use crate::workload::null::Null;
 use crate::workload::read::Read;
 use crate::workload::write::Write;
+use futures::channel::mpsc::{Sender, Receiver};
 
 mod config;
 mod progress;
@@ -51,17 +52,59 @@ async fn workload(conf: &RunCommand, session: Session) -> Arc<dyn Workload> {
     }
 }
 
-fn interval(rate: f64) -> Interval {
-    let interval = Duration::from_nanos(max(1, (1000000000.0 / rate) as u64));
-    tokio::time::interval(interval)
-}
-
 /// Rounds the duration down to the highest number of whole periods
 fn round(duration: Duration, period: Duration) -> Duration {
     let mut duration = duration.as_micros();
     duration /= period.as_micros();
     duration *= period.as_micros();
     Duration::from_micros(duration as u64)
+}
+
+
+/// Runs a series of requests on a separate thread and
+/// produces a stream of QueryStats
+fn req_stream<F, C, R, E>(
+    parallelism: usize,
+    rate: Option<f64>,
+    context: Arc<C>,
+    action: F,
+) -> impl Stream<Item = RequestStats>
+where
+    F: Fn(Arc<C>, u64) -> R + Send + Sync + Copy + 'static,
+    C: ?Sized + Send + Sync + 'static,
+    R: Future<Output = Result<WorkloadStats, E>> + Send,
+    E: Send + 'static
+{
+    let (mut tx, rx) = futures::channel::mpsc::channel(65536);
+    let rate = rate.map(|r| (r * 1000.0) as usize).unwrap_or(usize::MAX);
+
+    let mut stream = futures::stream::repeat(())
+        .enumerate()
+        .map(move |(i, _)| {
+            let context = context.clone();
+            async move {
+                let start = Instant::now();
+                let result = action(context, i as u64).await;
+                let end = Instant::now();
+                RequestStats::from_result(result, end - start)
+            }
+        })
+        .buffer_unordered(parallelism)
+        .map(Ok)
+        .forward(tx);
+
+    futures::executor::ThreadPool::builder()
+        .pool_size(1)
+        .create()
+        .unwrap()
+        .spawn_ok(async move {
+            match stream.await {
+                Ok(()) => println!("Done"),
+                Err(e) => println!("Error ***: {}", e)
+            }
+        });
+
+    rx
 }
 
 /// Executes the given function many times in parallel.
@@ -89,48 +132,26 @@ where
     F: Fn(Arc<C>, u64) -> R + Send + Sync + Copy + 'static,
     C: ?Sized + Send + Sync + 'static,
     R: Future<Output = Result<WorkloadStats, RE>> + Send,
-    RE: Send,
+    RE: Send + 'static,
 {
     let progress = FastProgressBar::new_progress_bar(name, count);
-    let stats = RefCell::new(Recorder::start(rate, parallelism));
-    let interval = interval(rate.unwrap_or(f64::MAX));
+    let mut stats = Recorder::start(rate, parallelism);
 
-    interval
-        .take(count as usize)
-        .enumerate()
-        .map(|(i, _)| {
-            let context = context.clone();
-            async move {
-                let start = Instant::now();
-                let result = action(context, i as u64).await;
-                let end = Instant::now();
-                result.map(|s|
-                    QueryStats {
-                        duration: max(Duration::from_micros(1), end - start),
-                        row_count: s.row_count,
-                        partition_count: s.partition_count,
-                    }
-                )
-            }
-        })
-        .for_each_concurrent(parallelism, |qs| async {
-            let r = qs.await;
-            let mut stats = stats.borrow_mut();
-            stats.record(r);
-            progress.tick();
+    let mut stream = req_stream(parallelism, rate, context, action).take(count as usize);
+    while let Some(r) = stream.next().await {
+        stats.record(r);
+        progress.tick();
 
-            let now = Instant::now();
-            if now - stats.last_sample_time() > sampling_period {
-                let start_time = stats.start_time;
-                let elapsed_rounded = round(now - start_time, sampling_period);
-                let sample_time = start_time + elapsed_rounded;
-                let log_line = stats.sample(sample_time).to_string();
-                progress.println(log_line);
-            }
-        })
-        .await;
-
-    stats.into_inner().finish()
+        // let now = Instant::now();
+        // if now - stats.last_sample_time() > sampling_period {
+        //     let start_time = stats.start_time;
+        //     let elapsed_rounded = round(now - start_time, sampling_period);
+        //     let sample_time = start_time + elapsed_rounded;
+        //     let log_line = stats.sample(sample_time).to_string();
+        //     progress.println(log_line);
+        // }
+    }
+    stats.finish()
 }
 
 fn load_report_or_abort(path: &PathBuf) -> Report {
@@ -246,11 +267,5 @@ async fn async_main() {
 
 fn main() {
     console::set_colors_enabled(true);
-    let mut runtime = tokio::runtime::Builder::new()
-        .basic_scheduler()
-        .enable_time()
-        .build()
-        .unwrap();
-
-    runtime.block_on(async_main());
+    executor::block_on(async_main());
 }

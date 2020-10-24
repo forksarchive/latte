@@ -1,5 +1,6 @@
-use std::cmp::min;
+use std::cmp::{min, max};
 use std::f64::consts;
+use std::time::{Duration, Instant};
 
 use cpu_time::ProcessTime;
 use hdrhistogram::Histogram;
@@ -8,7 +9,7 @@ use statrs::distribution::{StudentsT, Univariate};
 use strum::EnumCount;
 use strum::IntoEnumIterator;
 use strum_macros::{EnumCount as EnumCountM, EnumIter};
-use tokio::time::{Duration, Instant};
+use crate::workload::WorkloadStats;
 
 /// Controls the maximum order of autocovariance taken into
 /// account when estimating the long run mean error. Higher values make the estimator
@@ -129,11 +130,32 @@ pub fn t_test(mean1: &Mean, mean2: &Mean) -> f64 {
 }
 
 #[derive(Debug)]
-pub struct QueryStats {
+pub struct RequestStats {
     pub duration: Duration,
+    pub error_count: u64,
     pub row_count: u64,
     pub partition_count: u64,
 }
+
+impl RequestStats {
+    pub fn from_result<E>(s: Result<WorkloadStats, E>, duration: Duration) -> RequestStats {
+        match s {
+            Ok(s) => RequestStats {
+                duration,
+                error_count: 0,
+                row_count: s.row_count,
+                partition_count: s.partition_count
+            },
+            Err(_) => RequestStats {
+                duration,
+                error_count: 1,
+                row_count: 0,
+                partition_count: 0
+            }
+        }
+    }
+}
+
 
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, EnumIter, EnumCountM)]
@@ -228,7 +250,7 @@ impl Log {
 
     fn record(&mut self, duration: Duration) {
         self.curr_histogram
-            .record(duration.as_micros() as u64)
+            .record(max(1, duration.as_micros() as u64))
             .unwrap();
     }
 
@@ -412,22 +434,19 @@ impl Recorder {
 
     /// Adds the statistics of the completed request to the already collected statistics.
     /// Called on completion of each request.
-    pub fn record<E>(&mut self, item: Result<QueryStats, E>) {
-        match item {
-            Ok(s) => {
-                self.completed += 1;
-                self.rows += s.row_count;
-                self.partitions += s.partition_count;
-                self.log.record(s.duration);
-                self.resp_time_sum += s.duration.as_micros() as f64 / 1000.0;
-                self.resp_times
-                    .record(s.duration.as_micros() as u64)
-                    .unwrap();
-            }
-            Err(_) => {
-                self.errors += 1;
-            }
-        };
+    pub fn record(&mut self, s: RequestStats) {
+        if s.error_count == 0 {
+            self.completed += 1;
+        } else {
+            self.errors += 1;
+        }
+        self.rows += s.row_count;
+        self.partitions += s.partition_count;
+        self.log.record(s.duration);
+        self.resp_time_sum += s.duration.as_micros() as f64 / 1000.0;
+        self.resp_times
+            .record(max(1, s.duration.as_micros() as u64))
+            .unwrap();
     }
 
     /// Finishes the current sample, adds it to the log and starts a new one.
@@ -518,10 +537,10 @@ mod test {
     use statrs::distribution::Normal;
     use statrs::statistics::Statistics;
 
-    use crate::stats::{t_test, Mean};
+    use crate::stats::{Mean, t_test};
 
     /// Returns a random sample of size `len`.
-    /// All data points i.i.d with N(`mean`, `std_dev`).
+        /// All data points i.i.d with N(`mean`, `std_dev`).
     fn random_vector(seed: usize, len: usize, mean: f64, std_dev: f64) -> Vec<f32> {
         let mut rng = StdRng::seed_from_u64(seed as u64);
         let distrib = Normal::new(mean, std_dev).unwrap();
