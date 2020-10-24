@@ -1,7 +1,8 @@
-use std::cmp::{min, max};
+use std::cmp::{max, min};
 use std::f64::consts;
 use std::time::{Duration, Instant};
 
+use crate::workload::WorkloadStats;
 use cpu_time::ProcessTime;
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
@@ -9,7 +10,6 @@ use statrs::distribution::{StudentsT, Univariate};
 use strum::EnumCount;
 use strum::IntoEnumIterator;
 use strum_macros::{EnumCount as EnumCountM, EnumIter};
-use crate::workload::WorkloadStats;
 
 /// Controls the maximum order of autocovariance taken into
 /// account when estimating the long run mean error. Higher values make the estimator
@@ -144,18 +144,17 @@ impl RequestStats {
                 duration,
                 error_count: 0,
                 row_count: s.row_count,
-                partition_count: s.partition_count
+                partition_count: s.partition_count,
             },
             Err(_) => RequestStats {
                 duration,
                 error_count: 1,
                 row_count: 0,
-                partition_count: 0
-            }
+                partition_count: 0,
+            },
         }
     }
 }
-
 
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, EnumIter, EnumCountM)]
@@ -537,10 +536,10 @@ mod test {
     use statrs::distribution::Normal;
     use statrs::statistics::Statistics;
 
-    use crate::stats::{Mean, t_test};
+    use crate::stats::{t_test, Mean};
 
     /// Returns a random sample of size `len`.
-        /// All data points i.i.d with N(`mean`, `std_dev`).
+    /// All data points i.i.d with N(`mean`, `std_dev`).
     fn random_vector(seed: usize, len: usize, mean: f64, std_dev: f64) -> Vec<f32> {
         let mut rng = StdRng::seed_from_u64(seed as u64);
         let distrib = Normal::new(mean, std_dev).unwrap();

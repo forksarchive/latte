@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use cassandra_cpp::Session;
 use clap::Clap;
-use futures::{SinkExt, Stream, StreamExt, Future, TryFutureExt, executor};
 use futures::executor::LocalPool;
 use futures::task::{LocalSpawnExt, SpawnExt};
+use futures::{executor, Future, SinkExt, Stream, StreamExt, TryFutureExt};
 
 use config::RunCommand;
 
@@ -16,12 +16,14 @@ use crate::config::{AppConfig, Command, ShowCommand};
 use crate::progress::FastProgressBar;
 use crate::report::{Report, RunConfigCmp};
 use crate::session::*;
-use crate::stats::{BenchmarkCmp, BenchmarkStats, RequestStats, Recorder};
-use crate::workload::{Workload, WorkloadStats};
+use crate::stats::{BenchmarkCmp, BenchmarkStats, Recorder, RequestStats};
 use crate::workload::null::Null;
 use crate::workload::read::Read;
 use crate::workload::write::Write;
-use futures::channel::mpsc::{Sender, Receiver};
+use crate::workload::{Workload, WorkloadStats};
+use futures::channel::mpsc::{Receiver, Sender};
+use tokio::runtime::{Builder, Runtime};
+use tokio::time::Interval;
 
 mod config;
 mod progress;
@@ -52,6 +54,11 @@ async fn workload(conf: &RunCommand, session: Session) -> Arc<dyn Workload> {
     }
 }
 
+fn interval(rate: f64) -> Interval {
+    let interval = Duration::from_nanos(max(1, (1000000000.0 / rate) as u64));
+    tokio::time::interval(interval)
+}
+
 /// Rounds the duration down to the highest number of whole periods
 fn round(duration: Duration, period: Duration) -> Duration {
     let mut duration = duration.as_micros();
@@ -59,7 +66,6 @@ fn round(duration: Duration, period: Duration) -> Duration {
     duration *= period.as_micros();
     Duration::from_micros(duration as u64)
 }
-
 
 /// Runs a series of requests on a separate thread and
 /// produces a stream of QueryStats
@@ -73,12 +79,11 @@ where
     F: Fn(Arc<C>, u64) -> R + Send + Sync + Copy + 'static,
     C: ?Sized + Send + Sync + 'static,
     R: Future<Output = Result<WorkloadStats, E>> + Send,
-    E: Send + 'static
+    E: Send + 'static,
 {
-    let (mut tx, rx) = futures::channel::mpsc::channel(65536);
-    let rate = rate.map(|r| (r * 1000.0) as usize).unwrap_or(usize::MAX);
-
-    let mut stream = futures::stream::repeat(())
+    let (mut tx, rx) = futures::channel::mpsc::channel(1024);
+    let rate = rate.unwrap_or(f64::MAX);
+    let mut stream = interval(rate)
         .enumerate()
         .map(move |(i, _)| {
             let context = context.clone();
@@ -93,16 +98,12 @@ where
         .map(Ok)
         .forward(tx);
 
-    futures::executor::ThreadPool::builder()
-        .pool_size(1)
-        .create()
-        .unwrap()
-        .spawn_ok(async move {
-            match stream.await {
-                Ok(()) => println!("Done"),
-                Err(e) => println!("Error ***: {}", e)
-            }
-        });
+    tokio::spawn(async move {
+        match stream.await {
+            Ok(()) => println!("Done"),
+            Err(e) => println!("Error ***: {}", e),
+        }
+    });
 
     rx
 }
@@ -138,18 +139,17 @@ where
     let mut stats = Recorder::start(rate, parallelism);
 
     let mut stream = req_stream(parallelism, rate, context, action).take(count as usize);
-    while let Some(r) = stream.next().await {
-        stats.record(r);
-        progress.tick();
-
-        // let now = Instant::now();
-        // if now - stats.last_sample_time() > sampling_period {
-        //     let start_time = stats.start_time;
-        //     let elapsed_rounded = round(now - start_time, sampling_period);
-        //     let sample_time = start_time + elapsed_rounded;
-        //     let log_line = stats.sample(sample_time).to_string();
-        //     progress.println(log_line);
-        // }
+    while let Some(s) = stream.next().await {
+            stats.record(s);
+            progress.tick();
+            let now = Instant::now();
+            if now - stats.last_sample_time() > sampling_period {
+                let start_time = stats.start_time;
+                let elapsed_rounded = round(now - start_time, sampling_period);
+                let sample_time = start_time + elapsed_rounded;
+                let log_line = stats.sample(sample_time).to_string();
+                progress.println(log_line);
+            }
     }
     stats.finish()
 }
@@ -267,5 +267,10 @@ async fn async_main() {
 
 fn main() {
     console::set_colors_enabled(true);
-    executor::block_on(async_main());
+    Builder::new_current_thread()
+        .thread_name("tokio")
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(async_main());
 }
