@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use cassandra_cpp::Session;
 use clap::Clap;
-use futures::executor::LocalPool;
-use futures::task::{LocalSpawnExt, SpawnExt};
-use futures::{executor, Future, SinkExt, Stream, StreamExt, TryFutureExt};
+use futures::{Future, SinkExt, Stream, StreamExt};
+use tokio::runtime::Builder;
+use tokio::time::Interval;
 
 use config::RunCommand;
 
@@ -16,14 +16,11 @@ use crate::config::{AppConfig, Command, ShowCommand};
 use crate::progress::FastProgressBar;
 use crate::report::{Report, RunConfigCmp};
 use crate::session::*;
-use crate::stats::{BenchmarkCmp, BenchmarkStats, Recorder, RequestStats};
+use crate::stats::{BenchmarkCmp, BenchmarkStats, Recorder, RequestStats, Sample};
+use crate::workload::{Workload, WorkloadStats};
 use crate::workload::null::Null;
 use crate::workload::read::Read;
 use crate::workload::write::Write;
-use crate::workload::{Workload, WorkloadStats};
-use futures::channel::mpsc::{Receiver, Sender};
-use tokio::runtime::{Builder, Runtime};
-use tokio::time::Interval;
 
 mod config;
 mod progress;
@@ -70,38 +67,54 @@ fn round(duration: Duration, period: Duration) -> Duration {
 /// Runs a series of requests on a separate thread and
 /// produces a stream of QueryStats
 fn req_stream<F, C, R, E>(
+    count: u64,
     parallelism: usize,
     rate: Option<f64>,
+    sampling_period: Duration,
     context: Arc<C>,
     action: F,
-) -> impl Stream<Item = RequestStats>
+) -> impl Stream<Item = Sample>
 where
-    F: Fn(Arc<C>, u64) -> R + Send + Sync + Copy + 'static,
+    F: Fn(Arc<C>, u64) -> R + Send + Sync + 'static,
     C: ?Sized + Send + Sync + 'static,
     R: Future<Output = Result<WorkloadStats, E>> + Send,
     E: Send + 'static,
 {
     let (mut tx, rx) = futures::channel::mpsc::channel(1024);
-    let rate = rate.unwrap_or(f64::MAX);
-    let mut stream = interval(rate)
-        .enumerate()
-        .map(move |(i, _)| {
-            let context = context.clone();
-            async move {
-                let start = Instant::now();
-                let result = action(context, i as u64).await;
-                let end = Instant::now();
-                RequestStats::from_result(result, end - start)
-            }
-        })
-        .buffer_unordered(parallelism)
-        .map(Ok)
-        .forward(tx);
 
     tokio::spawn(async move {
-        match stream.await {
-            Ok(()) => println!("Done"),
-            Err(e) => println!("Error ***: {}", e),
+        let rate = rate.unwrap_or(f64::MAX);
+        let action = &action;
+        let mut req_stats = interval(rate)
+            .take(count as usize)
+            .enumerate()
+            .map(|(i, _)| {
+                let context = context.clone();
+                async move {
+                    let start = Instant::now();
+                    let result = action(context, i as u64).await;
+                    let end = Instant::now();
+                    RequestStats::from_result(result, end - start)
+                }
+            })
+            .buffer_unordered(parallelism);
+
+        let mut sample = Sample::new(Instant::now());
+        while let Some(req) = req_stats.next().await {
+            sample.record(req);
+            let now = Instant::now();
+            if now - sample.start_time > sampling_period {
+                let start_time = sample.start_time;
+                let elapsed_rounded = round(now - start_time, sampling_period);
+                let end_time = start_time + elapsed_rounded;
+                sample.finish(end_time);
+                tx.send(sample).await.unwrap();
+                sample = Sample::new(end_time);
+            }
+        }
+        if !sample.is_empty() {
+            sample.finish(Instant::now());
+            tx.send(sample).await.unwrap();
         }
     });
 
@@ -130,26 +143,27 @@ async fn par_execute<F, C, R, RE>(
     action: F,
 ) -> BenchmarkStats
 where
-    F: Fn(Arc<C>, u64) -> R + Send + Sync + Copy + 'static,
+    F: Fn(Arc<C>, u64) -> R + Send + Sync + 'static,
     C: ?Sized + Send + Sync + 'static,
     R: Future<Output = Result<WorkloadStats, RE>> + Send,
     RE: Send + 'static,
 {
     let progress = FastProgressBar::new_progress_bar(name, count);
+    let progress_ref_1 = Arc::new(progress);
+    let progress_ref_2 = progress_ref_1.clone();
     let mut stats = Recorder::start(rate, parallelism);
+    let action = move |c, i| {
+        let result = action(c, i);
+        progress_ref_1.tick();
+        result
+    };
 
-    let mut stream = req_stream(parallelism, rate, context, action).take(count as usize);
+    let mut stream = req_stream(count, parallelism, rate, sampling_period, context, action);
     while let Some(s) = stream.next().await {
-            stats.record(s);
-            progress.tick();
-            let now = Instant::now();
-            if now - stats.last_sample_time() > sampling_period {
-                let start_time = stats.start_time;
-                let elapsed_rounded = round(now - start_time, sampling_period);
-                let sample_time = start_time + elapsed_rounded;
-                let log_line = stats.sample(sample_time).to_string();
-                progress.println(log_line);
-            }
+        let aggregate = stats.record(&[s]);
+        if sampling_period.as_secs() < u64::MAX {
+            progress_ref_2.println(format!("{}", aggregate));
+        }
     }
     stats.finish()
 }
