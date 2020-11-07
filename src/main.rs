@@ -17,10 +17,10 @@ use crate::progress::FastProgressBar;
 use crate::report::{Report, RunConfigCmp};
 use crate::session::*;
 use crate::stats::{BenchmarkCmp, BenchmarkStats, Recorder, RequestStats, Sample};
-use crate::workload::{Workload, WorkloadStats};
 use crate::workload::null::Null;
 use crate::workload::read::Read;
 use crate::workload::write::Write;
+use crate::workload::{Workload, WorkloadStats};
 
 mod config;
 mod progress;
@@ -121,6 +121,26 @@ where
     rx
 }
 
+/// Waits until one item arrives in each of the streams
+/// and collects them into a vector.
+/// If all streams are finished, returns None.
+async fn take_one_of_each<S, T>(v: &mut Vec<S>) -> Option<Vec<T>>
+where
+    S: Stream<Item = T> + std::marker::Unpin,
+{
+    let mut result = Vec::with_capacity(v.len());
+    for s in v {
+        if let Some(item) = s.next().await {
+            result.push(item)
+        }
+    }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
+}
+
 /// Executes the given function many times in parallel.
 /// Draws a progress bar.
 /// Returns the statistics such as throughput or duration histogram.
@@ -136,6 +156,7 @@ where
 async fn par_execute<F, C, R, RE>(
     name: &str,
     count: u64,
+    threads: usize,
     parallelism: usize,
     rate: Option<f64>,
     sampling_period: Duration,
@@ -143,7 +164,7 @@ async fn par_execute<F, C, R, RE>(
     action: F,
 ) -> BenchmarkStats
 where
-    F: Fn(Arc<C>, u64) -> R + Send + Sync + 'static,
+    F: Fn(Arc<C>, u64) -> R + Send + Sync + Copy + 'static,
     C: ?Sized + Send + Sync + 'static,
     R: Future<Output = Result<WorkloadStats, RE>> + Send,
     RE: Send + 'static,
@@ -158,9 +179,22 @@ where
         result
     };
 
-    let mut stream = req_stream(count, parallelism, rate, sampling_period, context, action);
-    while let Some(s) = stream.next().await {
-        let aggregate = stats.record(&[s]);
+    let mut streams = Vec::with_capacity(threads);
+    let count = max(1, count / threads as u64);
+    for _ in 0..threads {
+        let s = req_stream(
+            count,
+            parallelism,
+            rate,
+            sampling_period,
+            context.clone(),
+            action.clone(),
+        );
+        streams.push(s)
+    }
+
+    while let Some(samples) = take_one_of_each(&mut streams).await {
+        let aggregate = stats.record(&samples);
         if sampling_period.as_secs() < u64::MAX {
             progress_ref_2.println(format!("{}", aggregate));
         }
@@ -199,6 +233,7 @@ async fn run(conf: RunCommand) {
     par_execute(
         "Populating...",
         workload.populate_count(),
+        conf.threads,
         conf.parallelism,
         None, // make it as fast as possible
         Duration::from_secs(u64::MAX),
@@ -210,6 +245,7 @@ async fn run(conf: RunCommand) {
     par_execute(
         "Warming up...",
         conf.warmup_count,
+        conf.threads,
         conf.parallelism,
         None,
         Duration::from_secs(u64::MAX),
@@ -222,6 +258,7 @@ async fn run(conf: RunCommand) {
     let stats = par_execute(
         "Running...",
         conf.count,
+        conf.threads,
         conf.parallelism,
         conf.rate,
         Duration::from_secs_f64(conf.sampling_period),
@@ -281,7 +318,7 @@ async fn async_main() {
 
 fn main() {
     console::set_colors_enabled(true);
-    Builder::new_current_thread()
+    Builder::new_multi_thread()
         .thread_name("tokio")
         .enable_time()
         .build()
